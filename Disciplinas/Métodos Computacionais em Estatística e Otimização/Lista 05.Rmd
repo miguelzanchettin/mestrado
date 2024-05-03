@@ -1,0 +1,331 @@
+---
+title: "Métodos Computacionais em Estatística e Otimização"
+subtitle: "Lista 05"
+author: "Miguel Zanchettin de Oliveira"
+date: "April, 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+if ('pacman' %in% rownames(installed.packages()) == FALSE) {
+  install.packages('pacman')
+  requite('pacman')
+} 
+
+pacman::p_load(
+  knitr, 
+  dplyr, 
+  BiocManager,
+  Rcpp,
+  stats,
+  irlba
+)
+
+# For python usage
+reticulate::use_condaenv('mestrado')
+reticulate::install_python()
+
+```
+
+# Álgebra Linear
+
+## Questão 01
+
+A decomposição de Cholesky de uma matriz simétrica e definida positiva é muito popular em estatística. Para você ter uma ideia do algoritmo [consulte](https://en.wikipedia.org/wiki/Cholesky_decomposition). 
+
+Use três diferentes abordagens para obter a decomposição de Cholesky de uma matriz positiva definida em R e/ou C++. As abordagens podem ser diferentes pacotes, diferentes classes ou mesmo diferentes linguagens. Se você conhece outras linguagens pode usar se julgar adequado. Para criar uma matriz positiva definida use o seguinte código. 
+```{r Q01_DDPositiva}
+
+x1 <- runif(30)
+x2 <- runif(30)
+grid <- expand.grid(x1, x2)
+DD <- dist(grid, diag = TRUE, upper = TRUE)
+DD_positiva <- exp(as.matrix(-DD, 100, 100)/0.3)
+
+```
+
+Tome cuidado com a classe das matrizes que você vai utilizar para comparar as diferentes abordagens. Considere matrizes de diferentes dimensões e use o pacote bench para a comparação em termos de tempo computacional.
+
+Importante explique cuidadosamente a diferença entre as abordagens e qual você julga ser a mais
+eficiente antes e após realizar o experimento computacional
+
+```{r Q01_Resposta}
+
+#--------------------------------------------------------------------
+# Geracao de matrizes
+#--------------------------------------------------------------------
+
+gerar_matriz_dd_positiva_n_por_n <- function (n){
+
+  x1 <- runif(n)
+  x2 <- runif(n)
+  grid <- expand.grid(x1, x2)
+  DD <- dist(grid, diag = TRUE, upper = TRUE)
+  
+  DD_positiva <- exp(as.matrix(-DD, 100, 100)/0.3)
+  return(as.matrix(DD_positiva))
+  
+} 
+
+mtxs <- list(
+  gerar_matriz_dd_positiva_n_por_n(n=2), 
+  gerar_matriz_dd_positiva_n_por_n(n=3), 
+  gerar_matriz_dd_positiva_n_por_n(n=5), 
+  gerar_matriz_dd_positiva_n_por_n(n=8), 
+  gerar_matriz_dd_positiva_n_por_n(n=13)
+  # ...
+)
+
+#--------------------------------------------------------------------
+# Implementacoes
+#--------------------------------------------------------------------
+
+#--------------------------------------------------------------------
+# 01 - Utilizando R-base
+
+
+implementacao_01 <- function (mtx) {
+  
+  dimensionSize <- nrow(mtx)
+  L <- matrix(0, nrow = dimensionSize, ncol = dimensionSize)
+  
+  for (i in 1:dimensionSize) {
+    for (j in 1:i) {
+      sum_val <- 0
+      for (k in 1:j) {
+        sum_val <- sum_val + L[i, k] * L[j, k]
+      }
+  
+      if (i == j) {
+        L[i, j] <- sqrt(mtx[i, i] - sum_val)
+      } else {
+        L[i, j] <- (1.0 / L[j, j]) * (mtx[i, j] - sum_val)
+      }
+    }
+  }
+  
+  return(L)
+
+}
+
+
+#--------------------------------------------------------------------
+# 02 - Utilizando funcao built-in
+
+implementacao_02 <- function (mtx) {
+  return(chol(mtx))
+}
+
+#--------------------------------------------------------------------
+# 03 - Utilizando funcao RCpp
+
+Rcpp::cppFunction('
+  NumericMatrix implementacao_03(NumericMatrix A) {
+    int dimensionSize = A.nrow();
+    NumericMatrix L(dimensionSize, dimensionSize);
+  
+    for (int i = 0; i < dimensionSize; i++) {
+      for (int j = 0; j <= i; j++) {
+        double sum = 0;
+        for (int k = 0; k < j; k++)
+          sum += L(i, k) * L(j, k);
+  
+        if (i == j)
+          L(i, j) = sqrt(A(i, i) - sum);
+        else
+          L(i, j) = (1.0 / L(j, j)) * (A(i, j) - sum);
+      }
+    }
+  
+    return L;
+  }
+')
+
+
+# Funcao de testes
+funcao_teste <- function(f, mtxs) {
+  res <- list()
+  for (i in 1:length(mtxs)) {
+    res[[i]] <- f(mtxs[[i]])
+  }
+  return(res)
+}
+
+
+#--------------------------------------------------------------------
+# Benchmarking
+#--------------------------------------------------------------------
+
+tempo_exec <- bench::mark(
+  funcao_teste(implementacao_01, mtxs), 
+  funcao_teste(implementacao_02, mtxs), 
+  funcao_teste(implementacao_03, mtxs), 
+  iterations=100, 
+  check=F
+)
+
+
+# Recupera funcoes
+exps <- c()
+exps[1] <- as.character(tempo_exec$expression[[1]])[2]
+exps[2] <- as.character(tempo_exec$expression[[2]])[2]
+exps[3] <- as.character(tempo_exec$expression[[3]])[2]
+
+# Mostra tabela
+knitr::kable(
+  tempo_exec %>%
+    as.data.frame() %>%
+    dplyr::select(min, median, mem_alloc) %>%
+    mutate(funcao = exps)
+)
+
+```
+
+> Antes, acreditava que a função implementada em Cpp seria a mais eficiente. Porém, após os testes, resume-se que a função built-in é a mais eficiente. Isto porque, segundo a documentação, a função tem partes implementadas em Fortran, por meio do pacote Lapack. \n É importante, por isso, destacar que a primeira função, utiliza da linguagem R para execução, o que não faz uso de paralelismo na execução e tem um consumo menos eficiente de memória. Também, a terceira função tem um desempenho suavemente melhorado justamente por conta desses controles de memória e paralelismo. Contudo, ainda não sendo os métodos mais eficientes, como os implementados na função built-in.
+
+## Questão 02
+Nas mesmas condições do exercício 1. Considere que é de interesse obter a decomposição em autovalores e autovetores. Novamente forneça três alternativas e compare os tempos computacionais.
+
+```{r Q02_resposta}
+
+
+#--------------------------------------------------------------------
+# Geracao de matrizes
+#--------------------------------------------------------------------
+
+gerar_matriz_dd_positiva_n_por_n <- function (n){
+
+  x1 <- runif(n)
+  x2 <- runif(n)
+  grid <- expand.grid(x1, x2)
+  DD <- dist(grid, diag = TRUE, upper = TRUE)
+  
+  DD_positiva <- exp(as.matrix(-DD, 100, 100)/0.3)
+  return(as.matrix(DD_positiva))
+  
+} 
+
+mtxs <- list(
+  gerar_matriz_dd_positiva_n_por_n(n=2), 
+  gerar_matriz_dd_positiva_n_por_n(n=3), 
+  gerar_matriz_dd_positiva_n_por_n(n=5), 
+  gerar_matriz_dd_positiva_n_por_n(n=8), 
+  gerar_matriz_dd_positiva_n_por_n(n=13)
+  # ...
+)
+
+#--------------------------------------------------------------------
+# Implementacoes
+#--------------------------------------------------------------------
+
+#--------------------------------------------------------------------
+# 01 - Utilizando R-base
+
+
+implementacao_01 <- function (mtx) {
+  
+  n <- nrow(mtx)
+  autovetores <- matrix(0, nrow = n, ncol = n)
+  
+  # Definir tolerância para verificação de convergência
+  tol <- 1e-10
+  
+  # Iterações para encontrar autovetores
+  for (i in 1:n) {
+    v <- rep(1, n)
+    lambda <- 0
+    
+    # Método das potências para encontrar o maior autovalor e autovetor associado
+    while (TRUE) {
+      v_anterior <- v
+      v <- mtx %*% v
+      lambda_anterior <- lambda
+      lambda <- sum(v^2)
+      v <- v / sqrt(lambda)
+      
+      if (abs(lambda - lambda_anterior) < tol || all(abs(v - v_anterior) < tol))
+        break
+    }
+    
+    # Armazenar autovetor encontrado
+    autovetores[, i] <- v
+  }
+  
+  # Calcular autovalores
+  autovalores <- diag(t(autovetores) %*% mtx %*% autovetores)
+  
+  # Retornar resultado como uma lista
+  return(list(autovalores = autovalores, 
+              autovetores = autovetores))
+
+}
+
+
+#--------------------------------------------------------------------
+# 02 - Utilizando funcao built-in
+
+implementacao_02 <- function (mtx) {
+  eig <- eigen(mtx)
+  return(list(autovalores = eig$values, 
+              autovetores = eig$vectors))
+}
+
+
+#--------------------------------------------------------------------
+# 03 - Utilizando funcao RCpp
+
+implementacao_03 <- function(mtx) {
+  py_mtx <- py$numpy$asarray(mtx)
+  reticulate::py_run_string("
+    import numpy as np
+    A = np.array(py_my_matrix)
+    eigenvalues, eigenvectors = np.linalg.eig(A)
+    ")
+  return(list(autovalores = py$eigenvalues, 
+              autovetores = py$eigenvectors))  
+}
+
+implementacao_03(mtx[[1]])
+
+
+# Funcao de testes  s
+funcao_teste <- function(f, mtxs) {
+  res <- list()
+  for (i in 1:length(mtxs)) {
+    res[[i]] <- f(mtxs[[i]])
+  }
+  return(res)
+}
+
+
+#--------------------------------------------------------------------
+# Benchmarking
+#--------------------------------------------------------------------
+
+tempo_exec <- bench::mark(
+  funcao_teste(implementacao_01, mtxs), 
+  funcao_teste(implementacao_02, mtxs), 
+  funcao_teste(implementacao_03, mtxs), 
+  iterations=100, 
+  check=F
+)
+
+
+# Recupera funcoes
+exps <- c()
+exps[1] <- as.character(tempo_exec$expression[[1]])[2]
+exps[2] <- as.character(tempo_exec$expression[[2]])[2]
+exps[3] <- as.character(tempo_exec$expression[[3]])[2]
+
+# Mostra tabela
+knitr::kable(
+  tempo_exec %>%
+    as.data.frame() %>%
+    dplyr::select(min, median, mem_alloc) %>%
+    mutate(funcao = exps)
+)
+
+```
