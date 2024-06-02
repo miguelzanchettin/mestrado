@@ -1,0 +1,292 @@
+---
+title: "Métodos Computacionais em Estatística e Otimização"
+subtitle: "Lista 06"
+author: "Miguel Zanchettin de Oliveira"
+date: "May, 2024"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+if ('pacman' %in% rownames(installed.packages()) == FALSE) {
+  install.packages('pacman')
+  requite('pacman')
+} 
+
+pacman::p_load(
+  knitr, 
+  dplyr, 
+  rootSolve, 
+  bench
+)
+
+
+```
+
+# Métodos Numéricos
+
+## Questão 01
+Considere o método regula-falsi para a solução de uma equação não linear. Forneça uma implementação em R deste método e use sua implementação para resolver a seguinte equação não linear.
+
+$$
+  D(\theta) = 2n[log({\hat{\theta} \over \theta}) + \hat{y}(\theta - \hat{\theta})] \le 3.84
+$$
+
+```{r questao01}
+
+# Implement the function
+D <- function(theta, n, hat_theta, hat_y) {
+  return(2 * n * (log(hat_theta / theta) + hat_y * (theta - hat_theta)))
+}
+
+# Regula-Falsi (False Position) method implementation
+regula_falsi <- function(f, a, b, tol = 1e-7, max_iter = 1000) {
+
+  if ((f(a) * f(b)) >= 0)
+    stop("The function must have different signs at the endpoints a and b");
+  
+  iter <- 0
+  c <- a  # Initializing c
+  
+  while (iter < max_iter) {
+    # Calculate the value of c
+    c <- b - (f(b) * (b - a)) / (f(b) - f(a))
+    
+    # Check if the root is found
+    if (abs(f(c)) < tol) {
+      return(list(root = c, iterations = iter))
+    }
+    
+    # Update the endpoints
+    if (f(a) * f(c) < 0) {
+      b <- c
+    } else {
+      a <- c
+    }
+    
+    iter <- iter + 1
+  }
+  
+  return(list(root = c, iterations = iter, message = "Maximum iterations reached"))
+}
+
+# Mask function assuming some constants
+f <- function(theta) {
+  return(D(theta, n=10, hat_theta=-1.5, hat_y=0.5))
+}
+
+# Aplly the method
+regula_falsi(f, a = -3, b = -1)
+
+```
+
+## Questão 02
+Use o método de Newton para resolver o seguinte sistema de equações não lineares
+
+$$
+  y = cos(x) \\
+  x = sen(y)
+$$
+
+Forneça a implementação do método de Newton e a aplicação ao sistema dado. Use para comparação as rotinas prontas do pacote rootSolve.
+
+```{r questao02}
+
+newton_method <- function(F, J, x0, tol = 1e-8, max_iter = 100) {
+  x <- x0
+  for (i in 1:max_iter) {
+    F_val <- F(x)
+    J_val <- J(x)
+    delta_x <- solve(J_val, F_val)
+    x <- x - delta_x
+    if (sqrt(sum(delta_x^2)) < tol) {
+      resultado = list('iteracoes' = i,
+                       'raizes' = x
+                       )
+      return(resultado)
+    }
+  }
+  resultado = list('iteracoes' = NA,
+                   'raizes' = x
+                   )
+  return(resultado)
+}
+
+F <- function(x) {
+  y <- x[2]
+  x <- x[1]
+  c(y - cos(x), x - sin(y))
+}
+
+J <- function(x) {
+  y <- x[2]
+  x <- x[1]
+  matrix(c(sin(x), 1, 1, -cos(y)), nrow = 2, byrow = TRUE)
+}
+
+x0 <- c(0.5, 0.5)  # Chute inicial
+resultado01 <- newton_method(F, J, x0)
+
+print(resultado01)
+
+```
+
+```{r questao2_multiroot}
+
+
+F_multiroot <- function(x) {
+  y <- x[2]
+  x <- x[1]
+  c(y - cos(x), x - sin(y))
+}
+
+resultado02 <- multiroot(F_multiroot, start = x0)
+
+print(resultado02)
+
+```
+
+
+```{r questao2_comparacao}
+
+bench::mark(
+  newton_method(F, J, x0)$raizes,
+  multiroot(F_multiroot, start = x0)$root
+)$median
+
+
+```
+
+## Questão 03
+Implemente o método quasi-Newton BFGS. Use a sua implementação para otimizar a seguinte função perda
+
+$$
+  L(y, \mu) = \sum_{n}^{i=1}{log(cosh(\mu_i, y_i))}
+$$
+
+Considere o seguinte código para gerar $y_i$. O parâmetro deve ser especificado como uma reta $\mu_i = \beta_0 + \beta_1 x_i$.
+
+```{r questao03_codigoinicial}
+
+set.seed(123)
+x1 <- rnorm(100)
+mu <- 5 + 3*x1
+y <- rt(n = 100, df = 3) + mu
+
+```
+
+Note que você deverá otimizar os parâmetros β0 e β1 que na simulação foram fixados em $\beta_0 = 5$ e $\beta_1 = 3$.
+
+```{r questao03}
+
+# Função de perda
+loss_function <- function(beta, x, y) {
+  mu <- beta[1] + beta[2] * x
+  return(sum(log(cosh(mu - y))))
+}
+
+# Função para calcular o gradiente da função de perda
+grad_loss_function <- function(beta, x, y) {
+  mu <- beta[1] + beta[2] * x
+  delta <- tanh(mu - y)
+  grad_beta0 <- sum(delta)
+  grad_beta1 <- sum(delta * x)
+  return(c(grad_beta0, grad_beta1))
+}
+
+# Inicialização dos parâmetros beta
+initial_beta <- c(0, 0)
+
+# Implementação do método BFGS
+result <- optim(
+  par = initial_beta,
+  fn = loss_function,
+  gr = grad_loss_function,
+  x = x1,
+  y = y,
+  method = "BFGS"
+)
+
+# Otimização
+optimal_beta <- result$par
+print(optimal_beta)
+
+```
+
+## Questão 04
+
+Considere o conjunto de dados (youtube.csv)[http://leg.ufpr.br/~wagner/data/] que apresenta o número de views e inscritos de dois canais de sucesso do youtube desde o dia de sua abertura. O objetivo é predizer o número acumulado de inscritos em cada um destes canais para o próximo ano (365 dias).
+
+Para isto você decidiu emprestar um modelo biológico que modela o crescimento de bactérias chamado
+de modelo logístico, dado pela seguinte equação:
+
+$$
+  y = {L \over {1 + exp(\beta(x - \beta_0))}}
+$$
+
+onde $L$ é o valor máximo da curva (platô), $\beta_0$ é o valor de $x$ no ponto médio da curva (tempo de meia-vida) e $\beta$ é a declividade da curva.
+
+A Figura abaixo apresenta um gráfico do modelo logístico.
+
+```{r questao04_grafico_enunciado_01, echo=F}
+
+par(mfrow = c(1,1), mar=c(2.6, 3, 1.2, 0.5), mgp = c(1.6, 0.6, 0), family='Arial')
+f_log <- function(DIAS, L, beta, beta0) {
+out <- L/(1+ exp(-beta*(DIAS - beta0)))
+return(out)
+}
+DIAS <- 1:800
+plot(f_log(DIAS = DIAS, L = 90, beta = 0.01, beta0 = 400) ~ DIAS,
+ylab = "Número de inscritos", xlab = "Dias da abertura",
+type = "l", ylim = c(0,95))
+abline(h = 90)
+text(x = 800, y = 93, label = "L")
+text(x = 425, y = f_log(DIAS = 400, L = 90, beta = 0.01, beta0 = 400),
+label = expression(beta))
+points(x = 400, pch = 19, col = "red",
+y = f_log(DIAS = 400, L = 90, beta = 0.01, beta0 = 400))
+
+```
+
+Note que o modelo representa a intuição de como o número acumulado de inscritos em um canal deve se comportar. No Código abaixo a base de dados é carregada e organizada por canal.
+
+```{r questao04_enunciado02, echo=F}
+
+url <- "http://leg.ufpr.br/~wagner/data/youtube.txt"
+dados <- read.table(url, header = TRUE)
+dados_canal <- split(dados, dados$CANAL)
+dados1 <- dados_canal[[1]]
+dados2 <- dados_canal[[2]]
+dados1$INSCRITOS <- dados1$INSCRITOS/100000
+dados1$Y <- cumsum(dados1$INSCRITOS)
+dados2$INSCRITOS <- dados2$INSCRITOS/100000
+dados2$Y <- cumsum(dados2$INSCRITOS)
+
+```
+
+Podemos fazer o gráfico dos dados observados para explicitar o objetivo de predizer o número de inscritos acumulado para os próximos 365 dias.
+
+```{r questao04_enunciado03, echo=F}
+
+par(mfrow = c(1,2), mar=c(2.6, 3, 1.2, 0.5), mgp = c(1.6, 0.6, 0), family='Arial')
+plot(dados1$Y ~ dados1$DIAS, xlim = c(0, 1215), ylim = c(0, 25),
+ylab = "Número de inscritos*100000", main = "Canal 1",
+xlab = "Dias", type = "o", cex = 0.1)
+abline(v = 850)
+plot(dados2$Y ~ dados2$DIAS, ylab = "Número de inscritos*100000", main = "Canal 2",
+xlab = "Dias", ylim = c(0, 50), xlim = c(0, 980), type = "p", cex = 0.1)
+abline(v = 607)
+
+```
+
+Escolha um destes canais e otimize o modelo logístico para predizer qual será o número acumulado de inscritos para os próximos 365 dias. Ao apresentar sua solução computacional faça o máximo para explicar as suas decisões e estratégias de implementação. Tome o máximo de cuidado para que a sua análise seja reproduzível.
+
+
+```{r questao04_resposta, echo=F}
+
+
+
+```
