@@ -3,6 +3,9 @@
 # Define ambiente
 #-------------------------------------------------------------------------
 
+# Modo DEBUG
+debuggingState(on=FALSE)
+
 # Reseta variaveis
 rm(list=ls())
 
@@ -20,7 +23,8 @@ pacman::p_load(
   "forecast", 
   "kernlab", 
   "randomForest", 
-  "xgboost"
+  "xgboost", 
+  "ggplot2"
 )
 
 ##########################################################################
@@ -141,22 +145,39 @@ get_atas <- function(atas.csv)
   
 }
 
-get_selic <- function(dates) 
+get_selic <- function(file, dates) 
 {
   
-  # Importa taxas
-  rates <- rbcb::get_series(c(selic = 432), 
-                            start_date = min(dates), 
-                            end_date = max(dates))
+  # Apenas importa o CSV
+  if (file.exists(file) == FALSE)
+  {
+    
+    # Importa taxas
+    rates <- rbcb::get_series(c(selic = 432))
+    
+    # Enriquece os dados com variaveis de lag
+    rates <- rates %>%
+      dplyr::filter(date %in% dates) %>%
+      dplyr::mutate(selic.lag = dplyr::lag(selic)) %>%
+      dplyr::mutate(selic.var = selic - selic.lag) %>%
+      dplyr::mutate(selic.next.var = lead(selic.var))
+    
+    # Exporta para CSV
+    write.csv(x = rates, 
+              file = file,
+              quote = TRUE, 
+              fileEncoding = 'utf-8',
+              row.names = FALSE
+    )
+    
+  }
   
-  # Enriquece os dados com variaveis de lag
-  rates <- rates %>%
-    dplyr::filter(date %in% dates) %>%
-    dplyr::mutate(selic.lag = dplyr::lag(selic)) %>%
-    dplyr::mutate(selic.var = selic - selic.lag) %>%
-    dplyr::mutate(selic.next.var = lead(selic.var))
   
-  return(rates)
+  # Importa CSV
+  selic <- read.csv(file = file, header = T, sep = ',') %>%
+    dplyr::mutate(date = lubridate::ymd(date))
+
+  return(selic)
   
 }
 
@@ -164,7 +185,7 @@ get_selic <- function(dates)
 # Executa
 
 dfAtas  <- get_atas('AtasCopom.csv')
-dfSelic <- get_selic(dates = dfAtas$date)
+dfSelic <- get_selic('SerieSELIC.csv', dates = dfAtas$date)
 
 dfUnida <- dfAtas %>% 
            left_join(dfSelic, by = 'date') %>%
@@ -182,9 +203,6 @@ meetings <- dfUnida %>% select(meeting) %>% distinct() %>% as.vector()
 meetings <- meetings[[1]]
 
 indTrain <- meetings[1:length(meetings) * pcTreino]
-
-dfTrain <- dfUnida %>% filter((meeting %in% indTrain))
-dfTest  <- dfUnida %>% filter(!(meeting %in% indTrain))
 
 ##########################################################################
 # Time series prediction
@@ -259,21 +277,7 @@ tsResultados <- projetarSerie(dfUnida, meetings, pcTreino)
 # Text mining
 #-------------------------------------------------------------------------
 
-padronizarDados <- function(extrairDe, aplicarEm) 
-{
-  
-  amostralMu <- extrairDe %>% sapply(mean)
-  amostralSigma <- extrairDe %>% sapply(sd)
-  
-  resultado <- scale(aplicarEm, 
-                     center = amostralMu, 
-                     scale = amostralSigma)
-  
-  return(resultado)
-  
-}
-
-aplicaEmbeddings <- function(gloveName, df, incluirTS = F) 
+aplicaEmbeddings <- function(gloveName, df) 
 {
   
   # Gera o lexico
@@ -298,12 +302,12 @@ aplicaEmbeddings <- function(gloveName, df, incluirTS = F)
   
   # Matriz de pesos
   mtxEmbedding <- gloveEmbedding %>%
-    pivot_longer(contains('d'), names_to = 'dimension') %>%
     inner_join(by='token',
                dfLexico %>%
                  distinct(word) %>%
                  rename(token=word)
-                ) %>%
+    ) %>%
+    pivot_longer(contains('d'), names_to = 'dimension') %>%
     cast_sparse(token, dimension, value)
   
   # Matriz de frequencias
@@ -318,8 +322,14 @@ aplicaEmbeddings <- function(gloveName, df, incluirTS = F)
     dplyr::count(meeting, token) %>%
     tidytext::cast_sparse(meeting, token, n)
   
+  # Limpa memoria
+  rm(list=c('gloveEmbedding'))
+  
   # Calcula matriz completa
   mtxCompleta <- mtxFrequency %*% mtxEmbedding
+  
+  # Limpa memoria
+  rm(list=c('mtxFrequency', 'mtxEmbedding'))
   
   # Traz selic.next.var para a matriz
   dfFinal <- mtxCompleta %>%
@@ -328,26 +338,122 @@ aplicaEmbeddings <- function(gloveName, df, incluirTS = F)
     mutate(meeting = as.double(rownames(.))) %>%
     left_join(by = 'meeting', 
                      df %>%
-                       dplyr::select(meeting, selic.var, selic.next.var) %>%
+                       dplyr::select(meeting, 
+                                     selic.var, 
+                                     selic.next.var) %>%
                        dplyr::distinct())
   
-  # Remove a serie
-  if (incluirTS == FALSE)
-  {
-    dfFinal <- dfFinal %>% select(-selic.var)  
-  }
-  
+  rm(list=c('mtxCompleta'))
+
   return(dfFinal)
 
 }
+
+gerarBases <- function(dfUnida, consideraTS = T)
+{
+  
+  possibleEmbeddings <- c('6B_D50',
+                        '6B_D100',
+                        '6B_D200',
+                        '6B_D300',
+                        '27B_D25',
+                        '27B_D50',
+                        '27B_D100'
+                        #'27B_D200' # Nao consigo processar por falta de RAM
+                        )
+  
+  resultados <- list()
+
+  # Inicia uma barra de progresso
+  pb <- txtProgressBar(min     = 0, 
+                       max     = length(possibleEmbeddings), 
+                       initial = 1,
+                       style   = 3, 
+                       label   = paste('Estimando embeddings'))
+  
+  for (indexEmbedding in 1:length(possibleEmbeddings))
+  {
+    
+    # Resgata qual o embedding atual
+    currentEmbeddingName <- possibleEmbeddings[indexEmbedding]
+    
+    # Monta nome do arquivo
+    file <- paste0('AtasComEmbedding', currentEmbeddingName, '.csv')
+    
+    if (file.exists(file) == FALSE)
+    {
+    
+      # Gera base
+      dfEmbeddings <- aplicaEmbeddings(currentEmbeddingName, dfUnida)
+      
+      # Exporta para CSV
+      write.csv(x = dfEmbeddings, 
+                file = file,
+                quote = TRUE, 
+                fileEncoding = 'utf-8',
+                row.names = FALSE
+                )
+      
+      # Limpa da memoria, para garantir sempre versao de importacao
+      rm(list=c('dfEmbeddings'))
+    
+    }
+    
+    # Importa CSV
+    dfEmbeddings <- read.csv(file = file, header = T, sep = ',')
+    
+    # Remove serie temporal
+    if (consideraTS == F)
+    {
+      dfEmbeddings <- dfEmbeddings %>% select(-selic.var)
+    }
+    
+    # Adiciona a lista
+    resultados[[currentEmbeddingName]] <- dfEmbeddings
+    
+    # Atualiza a barra de progresso
+    setTxtProgressBar(pb, indexEmbedding)
+    
+  }
+  
+  
+  # Fecha barra de progresso
+  close(pb)
+  
+  return(resultados)
+  
+}
+
+#-------------------------------------------------------------------------
+# Executa
+
+basesTratadasComTS <- gerarBases(dfUnida, T)
+basesTratadasSemTS <- gerarBases(dfUnida, F)
 
 ##########################################################################
 # Modelagem
 #-------------------------------------------------------------------------
 
-estimarModelos <- function (dfUnida, meetings, pcTreino, consideraTS)
+# Funcao auxiliar para padronizar dados
+padronizarDados <- function(extrairDe, aplicarEm) 
 {
   
+  amostralMu <- extrairDe %>% sapply(mean)
+  amostralSigma <- extrairDe %>% sapply(sd)
+  
+  resultado <- scale(aplicarEm, 
+                     center = amostralMu, 
+                     scale = amostralSigma)
+  
+  return(resultado)
+  
+}
+
+
+estimarModelos <- function (bases, meetings, pcTreino)
+{
+  
+  # Calcula os limites do loop de treinamento
   loopIni <- as.integer(length(meetings) * pcTreino)
   loopFim <- length(meetings)
   
@@ -355,87 +461,154 @@ estimarModelos <- function (dfUnida, meetings, pcTreino, consideraTS)
   yMatrix <- matrix(0, nrow = (loopFim - loopIni + 1), ncol = 1)
   colnames(yMatrix) <- c('y')
   
-  # Inicia uma barra de progresso
-  pb <- txtProgressBar(min = loopIni, max = (loopFim + 1), style = 3)
+  # Resgata possiveis embedings
+  possibleEmbeddings <- names(bases)
   
-  for (i in loopIni:loopFim)
+  # Inicia uma barra de progresso
+  pb <- txtProgressBar(min     = 0, 
+                       max     = length(possibleEmbeddings), 
+                       initial = 1,
+                       style   = 3, 
+                       title   = paste('Estimando embeddings')
+                       )
+  
+  for (indexEmbedding in 1:length(possibleEmbeddings))
   {
     
-    dfEmbeddingsTrain <- aplicaEmbeddings('27B_D25', dfUnida %>% filter(meeting %in% meetings[1:(i-1)]), consideraTS)
-    dfEmbeddingsTest  <- aplicaEmbeddings('27B_D25', dfUnida %>% filter(meeting %in% meetings[i]), consideraTS)
+    # Resgata qual o embedding atual
+    currentEmbeddingName <- possibleEmbeddings[indexEmbedding]
     
-    y.train <- dfEmbeddingsTrain$selic.next.var
-    X.train <- padronizarDados(extrairDe = dfEmbeddingsTrain %>% select(-meeting, -selic.next.var), 
-                               aplicarEm = dfEmbeddingsTrain %>% select(-meeting, -selic.next.var))
+    # Resgata os embeddings
+    dfEmbeddings <- bases[[currentEmbeddingName]]
     
-    y.test  <- dfEmbeddingsTest$selic.next.var
-    X.test <-  padronizarDados(extrairDe = dfEmbeddingsTrain %>% select(-meeting, -selic.next.var), 
-                               aplicarEm = dfEmbeddingsTest %>% select(-meeting, -selic.next.var))
-    
-    
-    estimarResultado <- function(model, utiliza_df = F)
+    # Loop da janela de treinamento
+    for (i in loopIni:loopFim)
     {
       
-      if (utiliza_df == T) y_hat <- predict(model, as.data.frame(X.test))
-      else y_hat <- predict(model, X.test)
+      # Coleta as bases
+      dfEmbeddingsTrain <- dfEmbeddings %>% 
+        filter(meeting %in% meetings[1:(i-1)])
       
-      y_hat <- discretizar_intervalo(y_hat)
-      y_hat <- as.double(y_hat)
-      return(y_hat)
+      dfEmbeddingsTest  <- dfEmbeddings %>% 
+        filter(meeting %in% meetings[i])
+      
+      # Padroniza dados de treino, 
+      # com base nos parametros dos dados de treino
+      y.train <- dfEmbeddingsTrain$selic.next.var
+      X.train <- padronizarDados(
+        extrairDe = dfEmbeddingsTrain %>% 
+         select(-meeting, -selic.next.var), 
+        aplicarEm = dfEmbeddingsTrain %>% 
+         select(-meeting, -selic.next.var)
+        ) %>%
+        as.array()
+      
+      # Padroniza dados de teste, 
+      # com base nos parametros dos dados de treino
+      y.test  <- dfEmbeddingsTest$selic.next.var
+      X.test <-  padronizarDados(
+        extrairDe = dfEmbeddingsTrain %>% 
+          select(-meeting, -selic.next.var), 
+        aplicarEm = dfEmbeddingsTest %>% 
+          select(-meeting, -selic.next.var)
+        ) %>%
+        as.array()
+      
+      # Funcao auxiliar para estimar resultado do modelo
+      estimarResultado <- function(model, utilizaDF = F)
+      {
+        
+        if (utilizaDF == T) y_hat <- predict(model, as.data.frame(X.test))
+        else y_hat <- predict(model, X.test)
+        
+        y_hat <- discretizar_intervalo(y_hat)
+        y_hat <- as.double(y_hat)
+        return(y_hat)
+      }
+      
+      # Funcao auxiliar para adicionar vetor de resultados 
+      # estimados do modelo na matriz de resultados
+      adicionarModelo <- function(
+        matriz, 
+        model, 
+        nomeModelo, 
+        currentEmbeddingName, 
+        utilizaDF
+      )
+      {
+        
+        # Adiciona o embedding ao nome do modelo
+        nomeTratado <- paste(sep = '.', 
+                             currentEmbeddingName, 
+                             nomeModelo)
+        
+        # Adiciona vetor na matriz
+        matriz <- criarColuna(matriz, nomeTratado)
+        
+        # Adiciona resultado no vetor
+        matriz[(i - loopIni + 1), nomeTratado] <- estimarResultado(
+          model, 
+          utilizaDF
+          )
+        
+        return(matriz)
+        
+      }
+      
+      # Valor correto
+      yMatrix <- criarColuna(yMatrix, 'y')
+      yMatrix[(i - loopIni + 1), 'y'] <- as.double(y.test)
+      
+      # SVR Linear
+      nomeModelo <- 'svrLinear'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'vanilladot', kpar = list(), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # SVR Polynomial Grau 2
+      nomeModelo <- 'svrPoly2degree'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 2), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # SVR Polynomial Grau 3
+      nomeModelo <- 'svrPoly3degree'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 3), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # SVR Polynomial Grau 4
+      nomeModelo <- 'svrPoly4degree'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 4), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # SVR Polynomial Grau 5
+      nomeModelo <- 'svrPoly5degree'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 5), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # SVR Radial Basis Function
+      nomeModelo <- 'svrRadial'
+      model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'rbfdot', kpar = list(), type = 'eps-svr')
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # Random Forest
+      nomeModelo <- 'randomForest'
+      model <- randomForest(x = X.train, y = y.train)
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # XGBoost
+      nomeModelo <- 'xgBoost'
+      model <- xgboost(data = X.train, label = y.train, nrounds = 300, objective = 'reg:squarederror', verbose = F)
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = F)
+      
+      # Regressao linear multipla
+      nomeModelo <- 'linearRegression'
+      model <- lm(y ~ ., data=as.data.frame(cbind(X.train, y = y.train)))
+      yMatrix <- adicionarModelo(yMatrix, model, nomeModelo, currentEmbeddingName, utilizaDF = T)
+      
     }
     
-    # Valor correto
-    yMatrix <- criarColuna(yMatrix, 'y')
-    yMatrix[(i - loopIni + 1), 'y'] <- as.double(y.test)
-    
-    # SVR Linear
-    yMatrix <- criarColuna(yMatrix, 'svrLinear')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'vanilladot', kpar = list(), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrLinear'] <- estimarResultado(model)
-  
-    # SVR Polynomial Grau 2
-    yMatrix <- criarColuna(yMatrix, 'svrPoly2degree')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 2), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrPoly2degree'] <- estimarResultado(model)
-   
-    # SVR Polynomial Grau 3
-    yMatrix <- criarColuna(yMatrix, 'svrPoly3degree')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 3), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrPoly3degree'] <- estimarResultado(model)
-    
-    # SVR Polynomial Grau 4
-    yMatrix <- criarColuna(yMatrix, 'svrPoly4degree')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 4), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrPoly4degree'] <- estimarResultado(model)
-  
-    # SVR Polynomial Grau 5
-    yMatrix <- criarColuna(yMatrix, 'svrPoly5degree')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'polydot', kpar = list('degree' = 5), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrPoly5degree'] <- estimarResultado(model)
-    
-    # SVR Radial Basis Function
-    yMatrix <- criarColuna(yMatrix, 'svrRadial')
-    model <- kernlab::ksvm(x = X.train, y = y.train, kernel = 'rbfdot', kpar = list(), type = 'eps-svr')
-    yMatrix[(i - loopIni + 1), 'svrRadial'] <- estimarResultado(model)
-   
-    # Random Forest
-    yMatrix <- criarColuna(yMatrix, 'randomForest')
-    model <- randomForest(x = X.train, y = y.train)
-    yMatrix[(i - loopIni + 1), 'randomForest'] <- estimarResultado(model)
-    
-    # XGBoost
-    yMatrix <- criarColuna(yMatrix, 'xgBoost')
-    model <- xgboost(data = X.train, label = y.train, nrounds = 100, objective = 'reg:squarederror', verbose = F)
-    yMatrix[(i - loopIni + 1), 'xgBoost'] <- estimarResultado(model)
-   
-    # Regressao linear multipla
-    yMatrix <- criarColuna(yMatrix, 'linearRegression')
-    model <- lm(y ~ ., data=as.data.frame(cbind(X.train, y = y.train)))
-    yMatrix[(i - loopIni + 1), 'linearRegression'] <- estimarResultado(model, T)
-    
     # Atualiza barra de progresso
-    setTxtProgressBar(pb, i)
-    
+    setTxtProgressBar(pb, indexEmbedding)
+  
   }
   
   # Encerra a barra de progresso
@@ -446,44 +619,104 @@ estimarModelos <- function (dfUnida, meetings, pcTreino, consideraTS)
 
 }
 
-ySemTS <- estimarModelos(dfUnida, meetings, pcTreino, FALSE)
-colnames(ySemTS) <- paste0(colnames(ySemTS), '.semTS')
+#-------------------------------------------------------------------------
+# Executa
 
-yComTS <- estimarModelos(dfUnida, meetings, pcTreino, TRUE)
-colnames(yComTS) <- paste0(colnames(yComTS), '.comTS')
+ySemTS <- estimarModelos(basesTratadasSemTS, meetings, pcTreino)
+yComTS <- estimarModelos(basesTratadasComTS, meetings, pcTreino)
 
-yMatrix <- cbind(ySemTS, yComTS)
+##########################################################################
+# Model selection
+#-------------------------------------------------------------------------
 
-# Adiciona as series temporais
-yMatrix <- cbind(yMatrix, timeSeries.comTS = tsResultados$y_hat[2:length(tsResultados$y_hat)])
-yMatrix <- cbind(yMatrix, timeSeries.semTS = tsResultados$y_hat[2:length(tsResultados$y_hat)])
-
-# Define itens para calcular metricas
-modelos <- colnames(yMatrix)
-metricas <- list()
-
-# Calcula metricas
-for (i in 2:length(modelos))
+calcularMetricas <- function(ys)
 {
-  metricas[[modelos[i]]] <- calcular_metricas(yMatrix[, 1], yMatrix[, i])
+  
+  ys = ySemTS
+  
+  # Define itens para calcular metricas
+  modelos <- colnames(ys)
+  metricas <- list()
+  
+  # Calcula metricas
+  for (i in 2:length(modelos))
+  {
+    metricas[[modelos[i]]] <- calcular_metricas(ys[, 1], ys[, i])
+  }
+  
+  # Formata metricas
+  metricas <- t(as.data.frame(metricas))
+  metricas <- cbind(str_split_fixed(rownames(metricas), "\\.", 3), 
+                    metricas)
+  metricas <- as.data.frame(metricas)
+  
+  # Corrige indices
+  colnames(metricas) <- c('Embedding', 'Modelo','Metrica', 'Valor')
+  rownames(metricas) <- c()
+  
+  # Gera Data Frame final
+  metricas <- metricas %>%
+    select(Embedding, Modelo, Metrica, Valor) %>%
+    mutate(Valor = as.double(Valor)) %>%
+    group_by(Embedding, Modelo, Metrica) %>%
+    pivot_wider(names_from = Metrica, 
+                values_from = Valor, 
+                values_fn = sum) %>% 
+    filter(Modelo != 'y')
+  
+  return(metricas)
+
 }
 
-# Formata metricas
-metricas <- t(as.data.frame(metricas))
-metricas <- cbind(str_split_fixed(rownames(metricas), "\\.", 3), metricas)
-metricas <- as.data.frame(metricas)
+#-------------------------------------------------------------------------
+# Executa
 
-colnames(metricas) <- c('Modelo', 'TS','Metrica', 'Valor')
-rownames(metricas) <- c()
+metricasSemTS <- calcularMetricas(ySemTS)
+metricasComTS <- calcularMetricas(yComTS)
 
-metricas <- metricas %>%
-  select(Modelo, TS, Metrica, Valor) %>%
-  mutate(Valor = as.double(Valor)) %>%
-  group_by(Modelo, TS, Metrica) %>%
-  pivot_wider(names_from = c(Metrica, TS), values_from = Valor, values_fn = sum)
-
-# Mostra metricas
-metricas
+metricasSemTS %>% arrange(MAE)
+metricasComTS %>% arrange(MAE)
 
 
+##########################################################################
+# Graficos de desempenho
+#-------------------------------------------------------------------------
 
+mostrarGraficos <- function()
+{
+  
+  # Plota grafico de todos os modelos
+  yMatrix %>%
+    as.data.frame() %>%
+    pivot_longer(cols = colnames(yMatrix), names_to = 'modelo', values_to = 'y') %>%
+    group_by(modelo) %>%
+    mutate(x = row_number()) %>%
+    mutate(tipo = str_split_fixed(modelo, "\\.", 2)[, 2]) %>%
+    mutate(modelo = str_split_fixed(modelo, "\\.", 2)[, 1]) %>%
+    ungroup() %>%
+    filter(tipo == 'semTS' & str_detect(modelo, 'svrPoly') == F) %>%
+    ggplot2::ggplot(aes(x = x, y = y)) +
+    ggplot2::geom_line(aes(colour = modelo), alpha = 0.3) +
+    ggplot2::theme_minimal(base_family = 'Arial') +
+    ggplot2::scale_colour_viridis_d(direction = 1) + 
+    ggplot2::coord_cartesian(ylim = c(-3, 3))
+  
+  # Plota grafico dos melhores
+  yMatrix %>%
+    as.data.frame() %>%
+    ggplot2::ggplot(aes(x=meetings[(length(meetings) * pcTreino):length(meetings)])) +
+    geom_line(aes(y = y.comTS, colour='Variação Real'), linewidth = 3) +
+    geom_line(aes(y = randomForest.semTS, colour='Random Forests (Apenas texto)'), linetype='solid', linewidth = 1) +
+    geom_line(aes(y = xgBoost.semTS, colour='XGBOOST (Apenas texto)'), linetype='solid', linewidth = 1) +
+    geom_line(aes(y = timeSeries.comTS, colour='Auto Arima (Apenas série temporal)'), linetype='solid', linewidth = 1) +
+    ggplot2::theme_minimal(base_family = 'Arial') +
+    ggplot2::scale_colour_viridis_d(direction = 1) +
+    labs(
+      title = 'Desempenho de modelos', 
+      subtitle = 'Apurados com janela de aprendizado móvel.\nIniciando com 154 e indo até 219 observações e prevendo um período a frente.\nEmbedding com 300 dimensões.',
+      x = 'Reunião Nº', y = 'Variação % na SELIC decidida na reunião seguinte'
+    )
+
+}
+
+#mostrarGraficos()
